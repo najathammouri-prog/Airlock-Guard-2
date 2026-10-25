@@ -1,0 +1,5 @@
+{
+  "framework": "vite",
+  "buildCommand": "pnpm --filter @workspace/airlock build",
+  "outputDirectory": "artifacts/airlock/dist/public"
+}

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { getNetworkDetails, requestAccess, signTransaction } from '@stellar/freighter-api';
 import {
   Activity,
   AlertTriangle,
@@ -28,6 +29,9 @@ type Transaction = {
   merchant: string;
   createdAt: string;
   status: TxStatus;
+  stellarDestination?: string;
+  stellarAmount?: string;
+  stellarHash?: string;
 };
 type DemoState = {
   limit: number;
@@ -36,61 +40,30 @@ type DemoState = {
   lastAlert: string | null;
 };
 
-const STORAGE_KEY = 'airlock-demo-state-v1';
+const STORAGE_KEY = 'airlock-demo-state-v3';
 const INITIAL_DEMO: DemoState = {
   limit: 500,
   budget: 4800,
-  lastAlert: 'A previous request exceeded the $500 per-request limit and was blocked automatically.',
-  transactions: [
-    {
-      id: 'REQ-0842',
-      agent: 'Atlas Procurement',
-      agentId: 'agent_atlas_01',
-      amount: 284.75,
-      purpose: 'Monthly cloud compute credits',
-      merchant: 'Northstar Cloud',
-      createdAt: 'Today, 10:24',
-      status: 'Pending',
-    },
-    {
-      id: 'REQ-0841',
-      agent: 'Atlas Procurement',
-      agentId: 'agent_atlas_01',
-      amount: 186.4,
-      purpose: 'Research data access',
-      merchant: 'Meridian Data Co.',
-      createdAt: 'Today, 09:51',
-      status: 'Approved',
-    },
-    {
-      id: 'REQ-0840',
-      agent: 'Cedar Travel Desk',
-      agentId: 'agent_cedar_02',
-      amount: 742.6,
-      purpose: 'Quarterly travel inventory',
-      merchant: 'Orbit Lodging',
-      createdAt: 'Today, 09:32',
-      status: 'Blocked',
-    },
-    {
-      id: 'REQ-0839',
-      agent: 'Atlas Procurement',
-      agentId: 'agent_atlas_01',
-      amount: 96.2,
-      purpose: 'Developer tooling renewal',
-      merchant: 'Patchwork Systems',
-      createdAt: 'Today, 08:16',
-      status: 'Approved',
-    },
-  ],
+  lastAlert: null,
+  transactions: [],
 };
-
 function loadDemo(): DemoState {
   try {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored) as DemoState;
-      if (Array.isArray(parsed.transactions) && typeof parsed.limit === 'number') return parsed;
+      if (Array.isArray(parsed.transactions) && typeof parsed.limit === 'number') {
+        const stellarTransactions = parsed.transactions.filter(
+          (transaction) => transaction.stellarDestination && transaction.stellarAmount,
+        );
+        return {
+          ...parsed,
+          transactions: stellarTransactions,
+          lastAlert: stellarTransactions.some((transaction) => transaction.status === 'Blocked')
+            ? parsed.lastAlert
+            : null,
+        };
+      }
     }
   } catch {
     // A blocked or malformed localStorage should never prevent the walkthrough.
@@ -116,7 +89,9 @@ function App() {
   const [modalOpen, setModalOpen] = useState(false);
   const [filter, setFilter] = useState('All activity');
   const [toast, setToast] = useState('');
-  const [requestForm, setRequestForm] = useState({ agent: 'Atlas Procurement', amount: '', purpose: '', merchant: '' });
+  const [requestForm, setRequestForm] = useState({ agent: 'Atlas Procurement', amount: '', purpose: '', merchant: '', stellarDestination: '', stellarAmount: '' });
+  const [walletAddress, setWalletAddress] = useState('');
+  const [walletBusy, setWalletBusy] = useState(false);
 
   useEffect(() => {
     try {
@@ -167,7 +142,31 @@ function App() {
     showToast(newlyBlocked ? 'Limit updated. An over-limit request was blocked.' : 'Per-request limit updated.');
   }
 
-  function approveRequest(id: string) {
+  async function connectWallet() {
+    setWalletBusy(true);
+    try {
+      const access = await requestAccess();
+      if (access.error || !access.address) throw new Error(access.error || 'Freighter did not return an address.');
+      setWalletAddress(access.address);
+      showToast('Connected ' + access.address.slice(0, 6) + '�' + access.address.slice(-5) + ' on Stellar testnet.');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not connect to Freighter.');
+    } finally { setWalletBusy(false); }
+  }
+
+  async function requestTestnetXlm() {
+    if (!walletAddress) { showToast('Connect Freighter before requesting testnet XLM.'); return; }
+    setWalletBusy(true);
+    try {
+      const response = await fetch('https://friendbot.stellar.org/?addr=' + encodeURIComponent(walletAddress));
+      if (!response.ok) throw new Error('Friendbot could not fund this account. Try again later.');
+      showToast('Testnet XLM requested. Refresh Freighter to see the balance.');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Could not reach Stellar Friendbot.');
+    } finally { setWalletBusy(false); }
+  }
+
+  async function approveRequest(id: string) {
     const target = demo.transactions.find((tx) => tx.id === id);
     if (!target || target.status !== 'Pending') return;
     if (target.amount > demo.limit) {
@@ -183,8 +182,38 @@ function App() {
       showToast('Not enough demo budget remains to approve this request.');
       return;
     }
-    setDemo({ ...demo, transactions: demo.transactions.map((tx) => tx.id === id ? { ...tx, status: 'Approved' } : tx) });
-    showToast(`${money(target.amount)} approved in demo mode.`);
+    if (!target.stellarDestination || !target.stellarAmount) {
+      showToast('This legacy demo request has no Stellar recipient or XLM amount. Create a new Stellar request to send a testnet payment.');
+      return;
+    }
+    if (!walletAddress) { showToast('Connect Freighter before approving a Stellar payment.'); return; }
+    setWalletBusy(true);
+    try {
+      const { STELLAR_TESTNET_PASSPHRASE, submitTestnetPayment } = await import('./lib/stellar');
+      const walletNetwork = await getNetworkDetails();
+      if (walletNetwork.error || walletNetwork.networkPassphrase !== STELLAR_TESTNET_PASSPHRASE) throw new Error('Switch Freighter to Stellar Testnet before approving.');
+      const result = await submitTestnetPayment({
+        sourceAddress: walletAddress,
+        destination: target.stellarDestination,
+        amount: target.stellarAmount,
+        memo: target.id,
+        sign: async (transactionXdr) => {
+          const signed = await signTransaction(transactionXdr, {
+            networkPassphrase: STELLAR_TESTNET_PASSPHRASE,
+            address: walletAddress,
+          });
+          if (signed.error || !signed.signedTxXdr) {
+            throw new Error(signed.error || 'Freighter did not return a signed transaction.');
+          }
+          return signed.signedTxXdr;
+        },
+      });
+      setDemo((current) => ({ ...current, transactions: current.transactions.map((tx) => tx.id === id ? { ...tx, status: 'Approved', stellarHash: result.hash } : tx) }));
+      showToast('Approved and submitted ' + target.stellarAmount + ' XLM on Stellar testnet.');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'The Stellar testnet payment failed.');
+    } finally { setWalletBusy(false); }
+
   }
 
   function denyRequest(id: string) {
@@ -202,8 +231,9 @@ function App() {
   function submitRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const amount = Number(requestForm.amount);
-    if (!requestForm.agent || !requestForm.purpose.trim() || !requestForm.merchant.trim() || !Number.isFinite(amount) || amount <= 0) {
-      showToast('Complete each field with a valid amount to simulate a request.');
+    const stellarAmount = Number(requestForm.stellarAmount);
+    if (!requestForm.agent || !requestForm.purpose.trim() || !requestForm.merchant.trim() || !Number.isFinite(amount) || amount <= 0 || !/^G[A-Z2-7]{55}$/.test(requestForm.stellarDestination.trim()) || !Number.isFinite(stellarAmount) || stellarAmount <= 0) {
+      showToast('Complete each field with a valid USD amount, Stellar testnet recipient, and XLM amount.');
       return;
     }
     const idNumber = 843 + demo.transactions.length - INITIAL_DEMO.transactions.length;
@@ -219,12 +249,14 @@ function App() {
       merchant: requestForm.merchant.trim(),
       createdAt: makeTime(),
       status: isBlocked ? 'Blocked' : 'Pending',
+      stellarDestination: requestForm.stellarDestination.trim(),
+      stellarAmount: stellarAmount.toFixed(7),
     };
     const alert = isBlocked
       ? `${id} triggered an automatic block: ${money(amount)} is above the ${money(demo.limit)} per-request limit.`
       : demo.lastAlert;
     setDemo({ ...demo, transactions: [transaction, ...demo.transactions], lastAlert: alert });
-    setRequestForm({ agent: 'Atlas Procurement', amount: '', purpose: '', merchant: '' });
+    setRequestForm({ agent: 'Atlas Procurement', amount: '', purpose: '', merchant: '', stellarDestination: '', stellarAmount: '' });
     setModalOpen(false);
     showToast(isBlocked ? 'Alert raised. Request blocked automatically.' : 'Request added to the approval queue.');
   }
@@ -253,8 +285,8 @@ function App() {
         <a className="nav-item" href="#history"><History /><span>Transaction log</span></a>
         <div className="side-spacer" />
         <div className="workspace-chip">
-          <strong>Demo workspace</strong>
-          Fictional agents · USD sandbox
+          <strong>AIRLOCK workspace</strong>
+          Stellar testnet · XLM payments
         </div>
         <div className="side-foot">CONTROL PLANE / 01</div>
       </aside>
@@ -264,8 +296,8 @@ function App() {
           <div className="crumb"><span>Workspace</span><ChevronRight size={13} /><strong>Overview</strong></div>
           <div className="mobile-brand"><LockKeyhole /><span>AIRLOCK</span></div>
           <div className="top-meta">
-            <span className="demo-pill"><span className="demo-dot" />DEMO MODE</span>
-            <span className="time-stamp">LOCAL SIMULATION</span>
+            <span className="demo-pill"><span className="demo-dot" />STELLAR TESTNET</span>
+            {walletAddress ? <span className="time-stamp">{walletAddress.slice(0, 6)}�{walletAddress.slice(-5)}</span> : <button className="button button-secondary" type="button" onClick={connectWallet} disabled={walletBusy}>{walletBusy ? 'Connecting�' : 'Connect Freighter'}</button>}
           </div>
         </header>
         <div className="content">
@@ -273,19 +305,20 @@ function App() {
             <div>
               <div className="eyebrow">Agent payment oversight</div>
               <h1>Good morning, operator.</h1>
-              <p className="subtitle">Review every request before it reaches a fictional checkout.</p>
+              <p className="subtitle">Review each request before approving its Stellar testnet payment.</p>
             </div>
             <div className="heading-actions">
+              {walletAddress && <button className="button button-secondary" type="button" onClick={requestTestnetXlm} disabled={walletBusy}>Get testnet XLM</button>}
               <button className="button button-secondary" type="button" onClick={resetDemo} data-testid="button-reset-demo"><RotateCcw />Reset demo</button>
               <button className="button button-primary" type="button" onClick={() => setModalOpen(true)} data-testid="button-simulate-request"><Plus />Simulate request</button>
             </div>
           </section>
 
-          <section className="metric-grid" aria-label="Demo account summary">
+          <section className="metric-grid" aria-label="Payment account summary">
             <div className="metric-card" data-testid="card-available-budget">
-              <div className="metric-label"><Wallet />Available demo budget</div>
+              <div className="metric-label"><Wallet />Available policy budget</div>
               <div className="metric-value" data-testid="text-available-budget">{money(available)}</div>
-              <div className="metric-note">of {money(demo.budget)} sandbox allocation</div>
+              <div className="metric-note">of {money(demo.budget)} local policy allocation</div>
             </div>
             <div className="metric-card" data-testid="card-spending-limit">
               <div className="metric-label"><SlidersHorizontal />Per-request limit</div>
@@ -324,13 +357,14 @@ function App() {
                   <div className="detail-list">
                     <div className="detail-row"><span>Purpose</span><span>{pending.purpose}</span></div>
                     <div className="detail-row"><span>Merchant</span><span>{pending.merchant}</span></div>
+                    {pending.stellarAmount && <div className="detail-row"><span>Stellar payment</span><span>{pending.stellarAmount} XLM � testnet</span></div>}
                     <div className="detail-row"><span>Submitted</span><span>{pending.createdAt}</span></div>
                   </div>
                   <div className="limit-banner">
                     <strong>Within policy.</strong> This request is {money(Math.max(0, demo.limit - pending.amount))} under the {money(demo.limit)} limit. Approval will reduce the available demo budget.
                   </div>
                   <div className="request-actions">
-                    <button className="button button-primary" type="button" onClick={() => approveRequest(pending.id)} data-testid={`button-approve-${pending.id}`}><Check />Approve request</button>
+                    <button className="button button-primary" type="button" onClick={() => void approveRequest(pending.id)} disabled={walletBusy} data-testid={`button-approve-${pending.id}`}><Check />Approve request</button>
                     <button className="button button-danger" type="button" onClick={() => denyRequest(pending.id)} data-testid={`button-block-${pending.id}`}><X />Block request</button>
                   </div>
                 </div>
@@ -338,7 +372,7 @@ function App() {
                 <div className="empty-state">
                   <CheckCircle2 size={24} />
                   <div style={{ marginTop: 10, color: '#445668', fontWeight: 700 }}>No requests waiting</div>
-                  <div style={{ marginTop: 5 }}>Simulate a new payment to continue the walkthrough.</div>
+                  <div style={{ marginTop: 5 }}>Create a new Stellar payment request to start.</div>
                   <button className="button button-secondary" style={{ marginTop: 14 }} type="button" onClick={() => setModalOpen(true)} data-testid="button-empty-simulate"><Plus />Add a request</button>
                 </div>
               )}
@@ -401,7 +435,7 @@ function App() {
                         <td><div>{tx.purpose}</div><div style={{ color: '#8b949b', fontSize: 10, marginTop: 3 }}>{tx.merchant}</div></td>
                         <td className="table-amount">{money(tx.amount)}</td>
                         <td className="table-date">{tx.createdAt}</td>
-                        <td><StatusBadge status={tx.status} /></td>
+                        <td><StatusBadge status={tx.status} />{tx.stellarHash && <div><a href={"https://stellar.expert/explorer/testnet/tx/" + tx.stellarHash} target="_blank" rel="noreferrer">View Stellar transaction</a></div>}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -410,21 +444,21 @@ function App() {
             ) : <div className="empty-state">No transactions match this filter.</div>}
           </section>
 
-          <section className="how-card" aria-label="How to run this demo">
+          <section className="how-card" aria-label="How to run a testnet payment">
             <div>
-              <div className="how-title">How to run this demo</div>
-              <div className="how-sub">A safe, local walkthrough. No setup or account required.</div>
+              <div className="how-title">How to run a testnet payment</div>
+              <div className="how-sub">Connect Freighter and create an XLM payment request.</div>
             </div>
             <div className="how-steps">
               <div className="how-step"><span className="step-number">1</span><span>Edit the limit, then save to update the guardrail.</span></div>
-              <div className="how-step"><span className="step-number">2</span><span>Simulate a request under the limit and approve it from the queue.</span></div>
-              <div className="how-step"><span className="step-number">3</span><span>Try an amount over the limit to see an alert and automatic block.</span></div>
+              <div className="how-step"><span className="step-number">2</span><span>Create a request with the XLM recipient and amount, then approve in Freighter.</span></div>
+              <div className="how-step"><span className="step-number">3</span><span>Try an amount over the policy limit to see an automatic block.</span></div>
             </div>
           </section>
 
           <footer className="safety-footer">
-            <div><strong>Demo only.</strong> AIRLOCK is a frontend simulation. It does not provide blockchain security and cannot move real funds. Changes stay in this browser.</div>
-            <div className="footer-mark"><Shield size={14} />FICTIONAL PAYMENTS / NO WALLET CONNECTED</div>
+            <div><strong>Testnet only.</strong> Payments use test XLM and require explicit Freighter confirmation. Do not use this test build for mainnet funds.</div>
+            <div className="footer-mark"><Shield size={14} />STELLAR TESTNET / FREIGHTER WALLET</div>
           </footer>
         </div>
       </main>
@@ -434,8 +468,8 @@ function App() {
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="request-modal-title">
             <div className="modal-head">
               <div>
-                <div className="modal-title" id="request-modal-title">Simulate a payment</div>
-                <div className="modal-copy">Create a fictional agent request. AIRLOCK will check it against your current {money(demo.limit)} limit.</div>
+                <div className="modal-title" id="request-modal-title">Create a Stellar payment request</div>
+                <div className="modal-copy">The USD amount is only for Airlock policy limits. Enter the actual XLM payment separately. Approval prompts Freighter and submits to testnet.</div>
               </div>
               <button className="icon-button" type="button" aria-label="Close dialog" onClick={() => setModalOpen(false)} data-testid="button-close-request-modal"><X /></button>
             </div>
@@ -454,6 +488,14 @@ function App() {
                   <div className="input-wrap"><span className="input-prefix">$</span><input className="field money" type="number" min="0.01" step="0.01" required placeholder="125.00" value={requestForm.amount} onChange={(event) => setRequestForm({ ...requestForm, amount: event.target.value })} data-testid="input-request-amount" /></div>
                 </label>
                 <label>
+                  <span className="form-label">Stellar recipient address</span>
+                  <input className="field" type="text" required pattern="G[A-Z2-7]{55}" title="Enter a Stellar testnet account address starting with G" placeholder="G�" value={requestForm.stellarDestination} onChange={(event) => setRequestForm({ ...requestForm, stellarDestination: event.target.value })} />
+                </label>
+                <label>
+                  <span className="form-label">Payment amount in XLM</span>
+                  <input className="field money" type="number" min="0.0000001" step="0.0000001" required placeholder="1.0000000" value={requestForm.stellarAmount} onChange={(event) => setRequestForm({ ...requestForm, stellarAmount: event.target.value })} />
+                </label>
+                <label>
                   <span className="form-label">What is it for?</span>
                   <input className="field" type="text" required maxLength={70} placeholder="e.g. Cloud compute credits" value={requestForm.purpose} onChange={(event) => setRequestForm({ ...requestForm, purpose: event.target.value })} data-testid="input-request-purpose" />
                 </label>
@@ -462,10 +504,10 @@ function App() {
                   <input className="field" type="text" required maxLength={50} placeholder="e.g. Northstar Cloud" value={requestForm.merchant} onChange={(event) => setRequestForm({ ...requestForm, merchant: event.target.value })} data-testid="input-request-merchant" />
                 </label>
               </div>
-              <div className="modal-hint">Above the current limit? The request will be blocked automatically and added to the transaction log.</div>
+              <div className="modal-hint">This sends native XLM on Stellar testnet after wallet approval. USD is a policy label only; no exchange rate is applied. Above the limit? The request is blocked automatically.</div>
               <div className="modal-actions">
                 <button className="button button-secondary" type="button" onClick={() => setModalOpen(false)} data-testid="button-cancel-request">Cancel</button>
-                <button className="button button-primary" type="submit" data-testid="button-submit-request"><Plus />Run simulation</button>
+                <button className="button button-primary" type="submit" data-testid="button-submit-request"><Plus />Create payment request</button>
               </div>
             </form>
           </section>
@@ -478,3 +520,5 @@ function App() {
 }
 
 export default App;
+
+
