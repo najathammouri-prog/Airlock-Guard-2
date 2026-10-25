@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "AIRLOCK"
+description = "A live-demo security dashboard for reviewing fictional AI-agent payment requests, enforcing a configurable spending limit, and viewing approved or blocked transactions. Demo only; no real payments or blockchain security."
+version = "1.0.0"
+id = "artifacts/airlock"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 26104
+
+[services.development]
+run = "pnpm --filter @workspace/airlock run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/airlock", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/airlock/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "26104"
+BASE_PATH = "/"
